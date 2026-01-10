@@ -32,13 +32,16 @@ if not OPENAI_KEY:
 client = OpenAI(api_key=OPENAI_KEY)
 
 MEMORY_FILE = os.environ.get("MEMORY_FILE", "memory.json")
-MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "12"))  # cate mesaje pastram / user
+MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "40"))  # cate mesaje pastram / user
 
 # =========================
 # SYSTEM PROMPT (memoria + stil)
 # =========================
 SYSTEM_PROMPT = """
 You are DAN, personal coach for Laurentiu Daniel Munteanu.
+You already know USER_PROFILE. 
+USER_PROFILE contains full information about Laurentiu.
+Always use USER_PROFILE as permanent memory.
 You speak Romanian WITHOUT diacritics. Natural, human, warm-but-firm.
 
 User profile (long-term memory):
