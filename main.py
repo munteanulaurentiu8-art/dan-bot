@@ -1,12 +1,10 @@
 import os
-import json
-import time
-import asyncio
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+import sqlite3
+import base64
+from datetime import datetime
 
+from openai import OpenAI
 from telegram import Update
-from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -15,239 +13,230 @@ from telegram.ext import (
     filters,
 )
 
-from openai import OpenAI
+# -----------------------------
+# ENV
+# -----------------------------
+TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()  # ex: gpt-4.1-mini sau gpt-4o-mini
+USER_PROFILE = os.getenv("USER_PROFILE", "").strip()
 
-# =========================
-# CONFIG
-# =========================
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TOKEN")
-OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # default ok si pentru text+image
-
-if not TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN (or TOKEN) env var.")
-if not OPENAI_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY env var.")
+DB_PATH = os.getenv("DB_PATH", "dan_memory.db").strip()
+MAX_HISTORY = int(os.getenv("MAX_HISTORY", "40").strip())
 
 client = OpenAI(api_key=OPENAI_KEY)
 
-MEMORY_FILE = os.environ.get("MEMORY_FILE", "memory.json")
-MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "40"))  # cate mesaje pastram / user
+# -----------------------------
+# SYSTEM PROMPT
+# -----------------------------
+SYSTEM_PROMPT = f"""
+You are DAN, the personal coach of Laurentiu.
+Language: Romanian (no diacritics is OK if user uses no diacritics, otherwise Romanian with diacritics is OK).
 
-# =========================
-# SYSTEM PROMPT (memoria + stil)
-# =========================
-SYSTEM_PROMPT = """
-You are DAN, personal coach for Laurentiu Daniel Munteanu.
-You already know USER_PROFILE. 
-USER_PROFILE contains full information about Laurentiu.
-Always use USER_PROFILE as permanent memory.
-You speak Romanian WITHOUT diacritics. Natural, human, warm-but-firm.
+Tone and style:
+- Natural, warm, human (not robotic).
+- Caring but disciplined: you encourage, but you also set boundaries.
+- No loops: do NOT greet every message, do NOT repeat the same daily questions.
+- Ask max 1 clarifying question only if truly needed.
+- Keep answers helpful and practical (not one-liners, not essays).
 
-User profile (long-term memory):
-- Name: Laurentiu Daniel Munteanu
-- Born: 08.07.1975
-- Height: 1.74 m
-- Target weight: 77–78 kg (fara burta)
-- Location: Bragadiru, Romania
-- Lifestyle: mixed; works a lot at desk/laptop
-- Sleep: approx 00:30–06:00 weekdays; relaxed weekends
-- Health: cholesterol slightly elevated; no major issues reported
-- Habits: smokes a little; alcohol occasionally
-- Values: family is #1; wants excellent business results
-- 5-year goals: health, vacations with family, business success
-- Wants: to look good physically, be mentally strong, loving and gentle with family
+If user provides date/time, treat it as ground truth for "today/now".
 
-Your coaching style:
-- Gentle but firm. Supportive, but you do not enable excuses.
-- No repeated greetings. Do not restart the conversation every message.
-- Do not spam daily question lists. Ask only what is needed, when needed.
-- If you need clarifying info, ask max 1-2 short questions.
-- Give practical next steps. Keep answers concise but useful.
-- When the user reports food/training, log it mentally and respond with guidance.
-- If user shows a food photo, estimate what it is and advise portions + balance.
+PERMANENT MEMORY (USER_PROFILE):
+{USER_PROFILE}
 
-Safety/health notes:
-- You are not a doctor. If symptoms suggest urgent risk, advise medical help.
-"""
+Food-photo behavior:
+- If user sends a food photo, identify foods, estimate rough portions, and judge if it fits Laurentiu’s goals.
+- Give 2-3 concrete adjustments (portion, order, add protein/veg, hydration, timing).
+- If missing context, ask ONLY 1 short question (e.g., "ai mai mancat ceva azi?").
 
-# =========================
-# SIMPLE PERSISTENT MEMORY
-# =========================
-def _load_memory() -> Dict[str, Any]:
-    if not os.path.exists(MEMORY_FILE):
-        return {"users": {}}
-    try:
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        # if corrupted, keep a backup and start fresh
-        try:
-            os.rename(MEMORY_FILE, MEMORY_FILE + ".bak")
-        except Exception:
-            pass
-        return {"users": {}}
+Safety:
+- Gym/health advice: prioritize safety (shoulder/neck/knee/back). If pain symptoms are concerning, recommend medical evaluation.
+""".strip()
 
-def _save_memory(mem: Dict[str, Any]) -> None:
-    tmp = MEMORY_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(mem, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, MEMORY_FILE)
-
-def _get_user_store(mem: Dict[str, Any], user_id: str) -> Dict[str, Any]:
-    users = mem.setdefault("users", {})
-    store = users.setdefault(
-        user_id,
-        {
-            "created_at": int(time.time()),
-            "history": [],            # list of {role, content}
-            "facts": {},              # place for structured facts later
-            "meta": {"greeted": False}
-        },
+# -----------------------------
+# DB helpers
+# -----------------------------
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            ts TEXT NOT NULL
+        )"""
     )
-    return store
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS state (
+            user_id TEXT PRIMARY KEY,
+            last_greeting_date TEXT
+        )"""
+    )
+    conn.commit()
+    return conn
 
-def _trim_history(store: Dict[str, Any]) -> None:
-    hist = store.get("history", [])
-    if len(hist) > MAX_HISTORY:
-        store["history"] = hist[-MAX_HISTORY:]
 
-def _append_history(store: Dict[str, Any], role: str, content: str) -> None:
-    store.setdefault("history", []).append({"role": role, "content": content})
-    _trim_history(store)
+def save_message(user_id: str, role: str, content: str):
+    conn = db()
+    conn.execute(
+        "INSERT INTO messages (user_id, role, content, ts) VALUES (?, ?, ?, ?)",
+        (user_id, role, content, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
 
-# =========================
-# OPENAI CALL (runs in thread to avoid blocking async loop)
-# =========================
-def _build_messages(store: Dict[str, Any], user_content: Any) -> List[Dict[str, Any]]:
-    """
-    user_content can be a string (text) or a structured content list (text+image).
-    """
-    msgs: List[Dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # Add short persistent context from facts if present (optional)
-    facts = store.get("facts", {})
-    if facts:
-        msgs.append({"role": "system", "content": f"Known facts (update carefully): {json.dumps(facts, ensure_ascii=False)}"})
+def load_history(user_id: str, limit: int):
+    conn = db()
+    cur = conn.execute(
+        "SELECT role, content FROM messages WHERE user_id=? ORDER BY id DESC LIMIT ?",
+        (user_id, limit),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    rows.reverse()
+    return [{"role": r, "content": c} for (r, c) in rows]
 
-    # Add conversation history
-    for m in store.get("history", []):
-        msgs.append({"role": m["role"], "content": m["content"]})
 
-    # Current user message
-    msgs.append({"role": "user", "content": user_content})
-    return msgs
+def get_state(user_id: str):
+    conn = db()
+    cur = conn.execute(
+        "SELECT last_greeting_date FROM state WHERE user_id=?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return {"last_greeting_date": row[0] if row else None}
 
-def _openai_chat(messages: List[Dict[str, Any]]) -> str:
+
+def set_greeting_date(user_id: str, date_str: str):
+    conn = db()
+    conn.execute(
+        """INSERT INTO state (user_id, last_greeting_date)
+           VALUES (?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             last_greeting_date=excluded.last_greeting_date
+        """,
+        (user_id, date_str),
+    )
+    conn.commit()
+    conn.close()
+
+# -----------------------------
+# OpenAI call
+# -----------------------------
+def ask_openai(messages):
     resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
+        model=MODEL,
         messages=messages,
-        temperature=0.7,
     )
-    return resp.choices[0].message.content or ""
+    return (resp.choices[0].message.content or "").strip()
 
-async def _openai_chat_async(messages: List[Dict[str, Any]]) -> str:
-    return await asyncio.to_thread(_openai_chat, messages)
-
-# =========================
-# TELEGRAM HANDLERS
-# =========================
+# -----------------------------
+# Handlers
+# -----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    mem = _load_memory()
     user_id = str(update.effective_user.id)
-    store = _get_user_store(mem, user_id)
+    today = datetime.now().strftime("%Y-%m-%d")
 
-    # Say hello only once
-    if not store.get("meta", {}).get("greeted", False):
-        store.setdefault("meta", {})["greeted"] = True
-        _save_memory(mem)
-        await update.message.reply_text(
-            "Salut, Laurentiu. Sunt DAN. Spune-mi ce facem acum: masa, sala, somn sau planul zilei?"
+    st = get_state(user_id)
+    if st["last_greeting_date"] != today:
+        set_greeting_date(user_id, today)
+        msg = (
+            "Salut, Laurentiu. Sunt DAN.\n"
+            "Spune-mi pe scurt: azi e zi de sala sau pauza? "
+            "Si ce ai mancat pana acum?"
         )
     else:
-        await update.message.reply_text("Spune-mi ce ai nevoie acum (masa/sala/somn/plan).")
+        msg = "Spune-mi ce vrei acum (mancare / sala / program / sanatate)."
 
-async def chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(msg)
+    save_message(user_id, "assistant", msg)
+
+
+async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
     user_text = (update.message.text or "").strip()
     if not user_text:
         return
 
-    mem = _load_memory()
-    user_id = str(update.effective_user.id)
-    store = _get_user_store(mem, user_id)
+    save_message(user_id, "user", user_text)
 
-    # typing indicator
-    await update.message.chat.send_action(action=ChatAction.TYPING)
+    history = load_history(user_id, MAX_HISTORY)
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(history)
 
-    # Append user message to history
-    _append_history(store, "user", user_text)
-
-    # Build messages and ask OpenAI
-    messages = _build_messages(store, user_text)
-    reply = await _openai_chat_async(messages)
-
-    # Append assistant reply to history and persist
-    _append_history(store, "assistant", reply)
-    _save_memory(mem)
+    try:
+        reply = ask_openai(messages)
+    except Exception as e:
+        reply = f"Am o problema tehnica (OpenAI). Detalii: {str(e)[:180]}"
 
     await update.message.reply_text(reply)
+    save_message(user_id, "assistant", reply)
 
-async def chat_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Handles photos (e.g. food images). Uses OpenAI vision via chat content.
+    Handles food photos.
+    Uses caption as the user's question. If missing caption -> default request.
+    Sends image as base64 data URL to the model.
     """
-    mem = _load_memory()
     user_id = str(update.effective_user.id)
-    store = _get_user_store(mem, user_id)
 
-    await update.message.chat.send_action(action=ChatAction.TYPING)
+    question = (update.message.caption or "").strip()
+    if not question:
+        question = "Analizeaza poza cu mancarea: ce este, portii aproximative si daca e ok pentru obiectivul meu."
 
-    caption = (update.message.caption or "").strip()
-    photo = update.message.photo[-1]  # highest resolution
-    file = await photo.get_file()
-    photo_url = file.file_path  # Telegram hosted URL
+    # Get best resolution photo
+    tg_photo = update.message.photo[-1]
+    file = await context.bot.get_file(tg_photo.file_id)
 
-    # Structured message: text + image
-    user_content: List[Dict[str, Any]] = []
-    text_part = caption if caption else "Analizeaza aceasta poza cu mancare si spune-mi ce este, cat e ok sa mananc si cum o echilibrez azi."
-    user_content.append({"type": "text", "text": text_part})
-    user_content.append({"type": "image_url", "image_url": {"url": photo_url}})
+    try:
+        file_bytes = await file.download_as_bytearray()
+        img_b64 = base64.b64encode(file_bytes).decode("utf-8")
+        mime = "image/jpeg"  # Telegram photos are typically jpeg
 
-    # Log a compact description in history (do not store the whole url repeatedly)
-    _append_history(store, "user", f"[PHOTO] {text_part}")
+        save_message(user_id, "user", f"[PHOTO] {question}")
 
-    messages = _build_messages(store, user_content)
-    reply = await _openai_chat_async(messages)
+        history = load_history(user_id, MAX_HISTORY)
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(history)
 
-    _append_history(store, "assistant", reply)
-    _save_memory(mem)
+        # Add multimodal message
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": question},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
+                ],
+            }
+        )
+
+        reply = ask_openai(messages)
+
+    except Exception as e:
+        reply = f"Nu am reusit sa analizez poza (tehnic). Detalii: {str(e)[:180]}"
 
     await update.message.reply_text(reply)
+    save_message(user_id, "assistant", reply)
 
-async def reset_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Optional: wipe history but keep greeted flag and base facts.
-    """
-    mem = _load_memory()
-    user_id = str(update.effective_user.id)
-    store = _get_user_store(mem, user_id)
-    store["history"] = []
-    store.setdefault("meta", {})["greeted"] = True
-    _save_memory(mem)
-    await update.message.reply_text("Ok. Am resetat istoricul conversatiei. Profilele si stilul raman.")
-
-# =========================
-# MAIN
-# =========================
+# -----------------------------
+# Main
+# -----------------------------
 def main():
+    if not TOKEN:
+        raise RuntimeError("Missing TELEGRAM_TOKEN")
+    if not OPENAI_KEY:
+        raise RuntimeError("Missing OPENAI_API_KEY")
+
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("reset", reset_memory))
-
-    # Photo first (so it doesn't get caught by text handler)
-    app.add_handler(MessageHandler(filters.PHOTO, chat_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_text))
+    app.add_handler(MessageHandler(filters.PHOTO, photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 
     app.run_polling()
 
