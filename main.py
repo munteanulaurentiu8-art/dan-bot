@@ -30,7 +30,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1-mini",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_text}
