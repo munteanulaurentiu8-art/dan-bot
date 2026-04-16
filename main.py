@@ -168,6 +168,30 @@ def get_history(user_id: int, limit: int = MAX_HISTORY):
     return [{"role": r[0], "content": r[1]} for r in rows]
 
 
+def get_last_workout_day(user_id: int) -> int:
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT content FROM chat_history WHERE user_id=? AND content LIKE '[WORKOUT_DAY]%' ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row or not row[0]:
+        return 0
+
+    try:
+        return int(row[0].replace("[WORKOUT_DAY]", "").strip())
+    except Exception:
+        return 0
+
+
+def get_next_workout_day(user_id: int) -> int:
+    last_day = get_last_workout_day(user_id)
+    return (last_day % 5) + 1
+
+
 # =========================
 # DAN PROMPT
 # =========================
@@ -175,16 +199,49 @@ SYSTEM_PROMPT = """
 Esti DAN, coach personal pentru Laurentiu.
 Vorbesti in romana, natural, cald, inteligent, cu umor fin cand se potriveste.
 NU repeti saluturi la fiecare mesaj. Saluti doar daca e prima interactiune a zilei sau daca utilizatorul saluta primul.
-Nu intri in bucle de intrebari. Pui maxim 1-2 intrebari scurte doar daca lipseste contextul.
+Nu intri in bucle de intrebari. Pui maxim 1 intrebare scurta doar daca lipseste un detaliu esential.
 Fii grijuliu SI disciplinat: empatie + actiune, fara rigiditate.
 
-Obiectiv: sanatate, longevitate, echilibru, familie, si mentinere greutate aproape de 78 kg.
-Cand utilizatorul trimite mancare/poze: descrie ce vezi si da recomandari practice (portii, proteine, legume, hidratare).
-Cand utilizatorul trimite antrenament: structureaza, propune progresii, recuperare si consecventa.
-Daca utilizatorul cere \"retine\" / \"tine minte\" / \"memoreaza\": salvezi ca nota de memorie.
-Daca utilizatorul foloseste comanda /logworkout, confirma pe scurt exercitiul si salveaza-l in jurnal.
+Obiectiv general: sanatate, longevitate, echilibru, familie si mentinere greutate aproape de 78 kg.
 
-Format raspuns: scurt-mediu, pe puncte cand ajuta. Ton prieten bun, nu robot.
+Cand utilizatorul trimite mancare sau poze:
+- descrie ce vezi
+- da recomandari practice despre portii, proteine, legume, hidratare
+
+Cand utilizatorul cere antrenament sau spune ca este la sala:
+- creezi DIRECT un program complet pentru ziua respectiva
+- structura trebuie sa fie mereu asa:
+  1. Incalzire (5-10 minute)
+  2. Exercitii la saltea / mobilitate / core
+  3. Exercitii principale la aparate sau cu gantere
+  4. Stretching final
+- programul trebuie sa fie clar, pe puncte
+- pentru fiecare exercitiu dai seturi x repetari
+- daca este util, dai si recomandare simpla de greutate de inceput
+- nu repeti aceeasi grupa musculara doua zile la rand
+- folosesti rotatie pe 5 zile astfel incat in 5 zile sa fie lucrat tot corpul:
+  Ziua 1: Piept + triceps
+  Ziua 2: Spate + biceps
+  Ziua 3: Picioare + abdomen
+  Ziua 4: Umeri + core
+  Ziua 5: Full body usor + mobilitate
+
+Cand utilizatorul trimite antrenamente efectuate:
+- structurezi raspunsul clar
+- propui progresii simple
+- incurajezi consecventa si recuperarea
+
+Cand utilizatorul foloseste comanda /logworkout:
+- confirmi pe scurt exercitiul
+- salvezi-l in jurnal
+
+Daca utilizatorul cere "retine" / "tine minte" / "memoreaza": salvezi ca nota de memorie.
+
+Format raspuns:
+- scurt-mediu
+- clar
+- pe puncte cand ajuta
+- ton de antrenor real, nu robot
 """
 
 
@@ -203,6 +260,42 @@ def clean_text(s: str) -> str:
     s = s.strip()
     s = re.sub(r"\s+", " ", s)
     return s
+
+
+def is_gym_trigger(text: str) -> bool:
+    t = (text or "").lower()
+    triggers = [
+        "sunt la sala",
+        "sunt la sală",
+        "hai sa incepem",
+        "hai să începem",
+        "incepem antrenamentul",
+        "începem antrenamentul",
+        "programul de azi",
+        "antrenamentul de azi",
+    ]
+    return any(trigger in t for trigger in triggers)
+
+
+def build_workout_request(user_id: int, original_text: str) -> tuple[str, int, str]:
+    day = get_next_workout_day(user_id)
+    day_map = {
+        1: "Piept + triceps",
+        2: "Spate + biceps",
+        3: "Picioare + abdomen",
+        4: "Umeri + core",
+        5: "Full body usor + mobilitate",
+    }
+    grupa = day_map[day]
+
+    enriched = (
+        f"{original_text}\n\n"
+        f"Astazi este Ziua {day}: {grupa}. "
+        f"Creeaza un antrenament complet pentru aceasta zi, cu structura fixa: "
+        f"incalzire, exercitii la saltea, exercitii la aparate sau gantere, apoi stretching. "
+        f"Nu cere prea multe clarificari. Actioneaza direct si clar."
+    )
+    return enriched, day, grupa
 
 
 def parse_workout_text(text: str):
@@ -408,6 +501,29 @@ async def logworkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = clean_text(update.message.text or "")
+
+    # Trigger inteligent pentru start de antrenament
+    if is_gym_trigger(user_text):
+        enriched_text, day, grupa = build_workout_request(user_id, user_text)
+        add_history(user_id, "user", user_text)
+        add_history(user_id, "assistant", f"[WORKOUT_DAY]{day}")
+
+        if should_save_to_memory(user_text):
+            add_note(user_id, user_text)
+
+        profile_txt = get_profile(user_id)
+        notes_txt = get_notes(user_id, limit=12)
+        history = get_history(user_id, limit=MAX_HISTORY)
+
+        try:
+            reply = openai_text_reply(profile_txt, notes_txt, history, enriched_text)
+        except Exception as e:
+            await update.message.reply_text(f"Eroare la raspuns (OpenAI). Incearca din nou. ({type(e).__name__})")
+            return
+
+        add_history(user_id, "assistant", reply)
+        await update.message.reply_text(reply)
+        return
 
     add_history(user_id, "user", user_text)
 
