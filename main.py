@@ -666,7 +666,7 @@ async def chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         enriched_text, day, grupa = build_workout_request(user_id, user_text)
 
         add_history(user_id, "user", user_text)
-        add_history(user_id, "assistant", f"[WORKOUT_DAY]{day}")
+        add_history(user_id, "system", f"[WORKOUT_DAY]{day}")
 
         if should_save_to_memory(user_text):
             add_note(user_id, user_text)
