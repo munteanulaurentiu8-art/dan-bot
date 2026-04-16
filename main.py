@@ -337,12 +337,15 @@ def parse_workout_text(text: str):
             greutate = parts[1].replace("kg", "").strip()
             repetari = parts[2].strip()
             rpe = parts[3].lower().replace("rpe", "").strip()
-            return {
-                "exercitiu": exercitiu,
-                "greutate": float(greutate.replace(",", ".")),
-                "repetari": int(repetari),
-                "rpe": float(rpe.replace(",", ".")),
-            }
+            try:
+                return {
+                    "exercitiu": exercitiu,
+                    "greutate": float(greutate.replace(",", ".")),
+                    "repetari": int(repetari),
+                    "rpe": float(rpe.replace(",", ".")),
+                }
+            except ValueError:
+                return None
 
     pattern = re.compile(
         r"^(?P<exercitiu>.+?)[,\-]\s*(?P<greutate>\d+[\.,]?\d*)\s*kg[,\-]\s*(?P<repetari>\d+)\s*(?:rep|repetari)?[,\-]\s*rpe\s*(?P<rpe>\d+[\.,]?\d*)$",
@@ -350,12 +353,15 @@ def parse_workout_text(text: str):
     )
     m = pattern.match(raw)
     if m:
-        return {
-            "exercitiu": m.group("exercitiu").strip(),
-            "greutate": float(m.group("greutate").replace(",", ".")),
-            "repetari": int(m.group("repetari")),
-            "rpe": float(m.group("rpe").replace(",", ".")),
-        }
+        try:
+            return {
+                "exercitiu": m.group("exercitiu").strip(),
+                "greutate": float(m.group("greutate").replace(",", ".")),
+                "repetari": int(m.group("repetari")),
+                "rpe": float(m.group("rpe").replace(",", ".")),
+            }
+        except ValueError:
+            return None
 
     return None
 
@@ -384,25 +390,25 @@ def send_workout_to_google_sheet(user_id: int, workout: dict) -> tuple[bool, str
 def get_last_logged_workout(user_id: int, exercitiu: str):
     conn = db_connect()
     cur = conn.cursor()
-    pattern = f'[WORKOUT]%'
     cur.execute(
-        "SELECT content FROM chat_history WHERE user_id=? AND role='user' AND content LIKE ? ORDER BY id DESC",
-        (user_id, pattern),
+        "SELECT content FROM chat_history WHERE user_id=? AND role='user' AND content LIKE '[WORKOUT]%' ORDER BY id DESC",
+        (user_id,),
     )
     rows = cur.fetchall()
     conn.close()
 
     exercitiu_lower = exercitiu.strip().lower()
+
     for row in rows:
         content = row[0]
         try:
-            if content.startswith("[WORKOUT] "):
-                payload = content.replace("[WORKOUT] ", "", 1)
-                data = json.loads(payload)
-                if data.get("exercitiu", "").strip().lower() == exercitiu_lower:
-                    return data
+            payload = content.replace("[WORKOUT] ", "", 1)
+            data = json.loads(payload)
+            if data.get("exercitiu", "").strip().lower() == exercitiu_lower:
+                return data
         except Exception:
             continue
+
     return None
 
 
@@ -419,29 +425,28 @@ def suggest_next_weight(last_workout: dict | None, current_workout: dict) -> str
         if current_rpe <= 6:
             next_weight = round(current_weight + 2.5, 1)
             return (
-                f"Ultima data ai avut {last_weight} kg x {last_reps} la RPE {last_rpe}. "
-                f"Acum ai avut RPE {current_rpe}, deci data viitoare poti creste clar la aproximativ {next_weight} kg, "
-                f"daca forma ramane buna."
+                f"Ultima data la {current_workout['exercitiu']} ai avut {last_weight} kg x {last_reps} la RPE {last_rpe}. "
+                f"Acum ai avut RPE {current_rpe}, deci data viitoare poti creste clar la aproximativ {next_weight} kg, daca forma ramane buna."
             )
 
         if 6 < current_rpe <= 7.5:
             next_weight = round(current_weight + 2.5, 1)
             return (
-                f"Ultima data ai avut {last_weight} kg x {last_reps} la RPE {last_rpe}. "
+                f"Ultima data la {current_workout['exercitiu']} ai avut {last_weight} kg x {last_reps} la RPE {last_rpe}. "
                 f"Acum ai avut {current_weight} kg x {current_reps} la RPE {current_rpe}. "
                 f"Data viitoare poti incerca aproximativ {next_weight} kg sau poti mentine greutatea si creste repetarile."
             )
 
         if 7.5 < current_rpe <= 8.5:
             return (
-                f"Ultima data ai avut {last_weight} kg x {last_reps} la RPE {last_rpe}. "
+                f"Ultima data la {current_workout['exercitiu']} ai avut {last_weight} kg x {last_reps} la RPE {last_rpe}. "
                 f"Acum ai avut RPE {current_rpe}, deci data viitoare cel mai bine mentii aproximativ {current_weight} kg "
                 f"si incerci executie foarte buna sau 1-2 repetari in plus."
             )
 
         return (
-            f"Ultima data ai avut {last_weight} kg x {last_reps} la RPE {last_rpe}. "
-            f"Acum ai avut RPE {current_rpe}, deci data viitoare ramai la aceeasi greutate sau chiar scazi usor daca simti ca forma sufera."
+            f"Ultima data la {current_workout['exercitiu']} ai avut {last_weight} kg x {last_reps} la RPE {last_rpe}. "
+            f"Acum ai avut RPE {current_rpe}, deci data viitoare ramai la aceeasi greutate sau chiar scazi usor daca forma sufera."
         )
 
     if current_rpe <= 6:
@@ -538,6 +543,43 @@ def openai_vision_reply(profile: str, notes: str, history: list, user_text: str,
 
 
 # =========================
+# Workout logging helper
+# =========================
+async def process_workout_log(update: Update, user_id: int, text: str):
+    workout = parse_workout_text(text)
+
+    if not workout:
+        return False
+
+    last_workout = get_last_logged_workout(user_id, workout["exercitiu"])
+
+    add_history(user_id, "user", f"[WORKOUT] {json.dumps(workout, ensure_ascii=False)}")
+    ok, info = send_workout_to_google_sheet(user_id, workout)
+
+    progression_text = suggest_next_weight(last_workout, workout)
+
+    if ok:
+        reply = (
+            f"Am salvat exercitiul ✅\n"
+            f"- Exercitiu: {workout['exercitiu']}\n"
+            f"- Greutate: {workout['greutate']}\n"
+            f"- Repetari: {workout['repetari']}\n"
+            f"- RPE: {workout['rpe']}\n\n"
+            f"Repere pentru data viitoare:\n{progression_text}"
+        )
+    else:
+        reply = (
+            "Am inteles exercitiul, dar nu l-am putut trimite in Google Sheet.\n"
+            f"Motiv: {info}\n\n"
+            f"Repere pentru data viitoare:\n{progression_text}"
+        )
+
+    add_history(user_id, "assistant", reply)
+    await update.message.reply_text(reply)
+    return True
+
+
+# =========================
 # Telegram handlers
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -575,46 +617,24 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def logworkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text or ""
-    workout = parse_workout_text(text)
 
-    if not workout:
+    worked = await process_workout_log(update, user_id, text)
+    if not worked:
         await update.message.reply_text(
-            "Formatul nu a fost inteles. Foloseste asa:\n/logworkout Piept aparat | 10 | 12 | 7\n\nsau:\n/logworkout Piept aparat, 10 kg, 12 repetari, RPE 7"
+            "Formatul nu a fost inteles. Foloseste asa:\n/logworkout Piept aparat | 10 | 12 | 7\n\nsau fara comanda:\nPiept aparat | 10 | 12 | 7"
         )
-        return
-
-    last_workout = get_last_logged_workout(user_id, workout["exercitiu"])
-
-    add_history(user_id, "user", f"[WORKOUT] {json.dumps(workout, ensure_ascii=False)}")
-    ok, info = send_workout_to_google_sheet(user_id, workout)
-
-    progression_text = suggest_next_weight(last_workout, workout)
-
-    if ok:
-        reply = (
-            f"Am salvat exercitiul ✅\n"
-            f"- Exercitiu: {workout['exercitiu']}\n"
-            f"- Greutate: {workout['greutate']}\n"
-            f"- Repetari: {workout['repetari']}\n"
-            f"- RPE: {workout['rpe']}\n\n"
-            f"Repere pentru data viitoare:\n{progression_text}"
-        )
-    else:
-        reply = (
-            "Am inteles exercitiul, dar nu l-am putut trimite in Google Sheet.\n"
-            f"Motiv: {info}\n\n"
-            f"Repere pentru data viitoare:\n{progression_text}"
-        )
-
-    add_history(user_id, "assistant", reply)
-    await update.message.reply_text(reply)
 
 
 async def chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = clean_text(update.message.text or "")
 
-    # Trigger inteligent pentru start de antrenament
+    # 1. Daca textul pare log de exercitiu, il salvam automat fara /logworkout
+    if parse_workout_text(user_text):
+        await process_workout_log(update, user_id, user_text)
+        return
+
+    # 2. Trigger inteligent pentru start de antrenament
     if is_gym_trigger(user_text):
         enriched_text, day, grupa = build_workout_request(user_id, user_text)
 
@@ -638,6 +658,7 @@ async def chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply)
         return
 
+    # 3. Conversatie normala
     add_history(user_id, "user", user_text)
 
     if should_save_to_memory(user_text):
