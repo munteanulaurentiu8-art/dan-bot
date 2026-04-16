@@ -23,7 +23,7 @@ from openai import OpenAI
 # =========================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "40"))
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL", "").strip()
 
@@ -192,12 +192,23 @@ def get_next_workout_day(user_id: int) -> int:
     return (last_day % 5) + 1
 
 
+def get_workout_day_label(day: int) -> str:
+    day_map = {
+        1: "Piept + triceps",
+        2: "Spate + biceps",
+        3: "Picioare + abdomen",
+        4: "Umeri + core",
+        5: "Full body usor + mobilitate",
+    }
+    return day_map.get(day, "Full body usor + mobilitate")
+
+
 # =========================
 # DAN PROMPT
 # =========================
 SYSTEM_PROMPT = """
 Esti DAN, coach personal pentru Laurentiu.
-Vorbesti in romana, natural, cald, inteligent, cu umor fin cand se potriveste.
+Vorbesti in romana, natural, cald, inteligent, motivant si practic.
 NU repeti saluturi la fiecare mesaj. Saluti doar daca e prima interactiune a zilei sau daca utilizatorul saluta primul.
 Nu intri in bucle de intrebari. Pui maxim 1 intrebare scurta doar daca lipseste un detaliu esential.
 Fii grijuliu SI disciplinat: empatie + actiune, fara rigiditate.
@@ -210,24 +221,34 @@ Cand utilizatorul trimite mancare sau poze:
 
 Cand utilizatorul cere antrenament sau spune ca este la sala:
 - creezi DIRECT un program complet pentru ziua respectiva
+- NU astepti multe clarificari
 - structura trebuie sa fie mereu asa:
   1. Incalzire (5-10 minute)
-  2. Exercitii la saltea / mobilitate / core
+  2. Exercitii la saltea / mobilitate / activare / core
   3. Exercitii principale la aparate sau cu gantere
   4. Stretching final
 - programul trebuie sa fie clar, pe puncte
 - pentru fiecare exercitiu dai seturi x repetari
 - daca este util, dai si recomandare simpla de greutate de inceput
+- adaptezi antrenamentul pentru un adult care vrea progres sanatos, nu extrem
+
+Rotatia pe 5 zile este:
+Ziua 1: Piept + triceps
+Ziua 2: Spate + biceps
+Ziua 3: Picioare + abdomen
+Ziua 4: Umeri + core
+Ziua 5: Full body usor + mobilitate
+
+Reguli importante:
 - nu repeti aceeasi grupa musculara doua zile la rand
-- folosesti rotatie pe 5 zile astfel incat in 5 zile sa fie lucrat tot corpul:
-  Ziua 1: Piept + triceps
-  Ziua 2: Spate + biceps
-  Ziua 3: Picioare + abdomen
-  Ziua 4: Umeri + core
-  Ziua 5: Full body usor + mobilitate
+- tii cont de ziua de antrenament transmisa in prompt
+- daca utilizatorul pare obosit, reduci intensitatea
+- daca utilizatorul merge bine, poti sugera progresie usoara
+- raspunsurile trebuie sa fie clare, scurte-medii si utile
 
 Cand utilizatorul trimite antrenamente efectuate:
 - structurezi raspunsul clar
+- confirmi exercitiile
 - propui progresii simple
 - incurajezi consecventa si recuperarea
 
@@ -237,11 +258,12 @@ Cand utilizatorul foloseste comanda /logworkout:
 
 Daca utilizatorul cere "retine" / "tine minte" / "memoreaza": salvezi ca nota de memorie.
 
-Format raspuns:
-- scurt-mediu
+Ton:
+- antrenor bun + prieten
 - clar
-- pe puncte cand ajuta
-- ton de antrenor real, nu robot
+- motivant
+- realist
+- nu robot
 """
 
 
@@ -273,27 +295,26 @@ def is_gym_trigger(text: str) -> bool:
         "începem antrenamentul",
         "programul de azi",
         "antrenamentul de azi",
+        "sunt la gym",
+        "am ajuns la sala",
+        "am ajuns la sală",
     ]
     return any(trigger in t for trigger in triggers)
 
 
 def build_workout_request(user_id: int, original_text: str) -> tuple[str, int, str]:
     day = get_next_workout_day(user_id)
-    day_map = {
-        1: "Piept + triceps",
-        2: "Spate + biceps",
-        3: "Picioare + abdomen",
-        4: "Umeri + core",
-        5: "Full body usor + mobilitate",
-    }
-    grupa = day_map[day]
+    grupa = get_workout_day_label(day)
 
     enriched = (
         f"{original_text}\n\n"
-        f"Astazi este Ziua {day}: {grupa}. "
-        f"Creeaza un antrenament complet pentru aceasta zi, cu structura fixa: "
-        f"incalzire, exercitii la saltea, exercitii la aparate sau gantere, apoi stretching. "
-        f"Nu cere prea multe clarificari. Actioneaza direct si clar."
+        f"Astazi este Ziua {day}: {grupa}.\n"
+        f"Creeaza un antrenament complet pentru aceasta zi, respectand structura fixa:\n"
+        f"1. Incalzire\n"
+        f"2. Exercitii la saltea / activare / core\n"
+        f"3. Exercitii principale la aparate sau gantere\n"
+        f"4. Stretching final\n\n"
+        f"Fa programul clar, practic, bine structurat si direct aplicabil in sala."
     )
     return enriched, day, grupa
 
@@ -505,6 +526,7 @@ async def chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Trigger inteligent pentru start de antrenament
     if is_gym_trigger(user_text):
         enriched_text, day, grupa = build_workout_request(user_id, user_text)
+
         add_history(user_id, "user", user_text)
         add_history(user_id, "assistant", f"[WORKOUT_DAY]{day}")
 
@@ -588,4 +610,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
