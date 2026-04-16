@@ -5,6 +5,7 @@ import base64
 import sqlite3
 from datetime import datetime, timezone
 
+import requests
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -20,10 +21,11 @@ from openai import OpenAI
 # =========================
 # ENV
 # =========================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")  # exact cum ai zis
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "40"))
+GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL", "").strip()
 
 # DB path (ideal pe un Railway Volume montat la /app/data)
 DB_DIR = os.environ.get("DB_DIR", "/app/data")
@@ -33,7 +35,6 @@ if not TELEGRAM_TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN env var")
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY env var")
-
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -138,7 +139,6 @@ def get_notes(user_id: int, limit: int = 12) -> str:
     conn.close()
     if not rows:
         return ""
-    # reverse ca sa fie cronologic
     notes = [r[0] for r in rows][::-1]
     return "\n".join(f"- {n}" for n in notes)
 
@@ -164,13 +164,12 @@ def get_history(user_id: int, limit: int = MAX_HISTORY):
     )
     rows = cur.fetchall()
     conn.close()
-    # reverse cronologic
     rows = rows[::-1]
     return [{"role": r[0], "content": r[1]} for r in rows]
 
 
 # =========================
-# DAN "PERSONALITY" PROMPT
+# DAN PROMPT
 # =========================
 SYSTEM_PROMPT = """
 Esti DAN, coach personal pentru Laurentiu.
@@ -182,12 +181,16 @@ Fii grijuliu SI disciplinat: empatie + actiune, fara rigiditate.
 Obiectiv: sanatate, longevitate, echilibru, familie, si mentinere greutate aproape de 78 kg.
 Cand utilizatorul trimite mancare/poze: descrie ce vezi si da recomandari practice (portii, proteine, legume, hidratare).
 Cand utilizatorul trimite antrenament: structureaza, propune progresii, recuperare si consecventa.
-Daca utilizatorul cere "retine" / "tine minte" / "memoreaza": salvezi ca nota de memorie.
+Daca utilizatorul cere \"retine\" / \"tine minte\" / \"memoreaza\": salvezi ca nota de memorie.
+Daca utilizatorul foloseste comanda /logworkout, confirma pe scurt exercitiul si salveaza-l in jurnal.
 
 Format raspuns: scurt-mediu, pe puncte cand ajuta. Ton prieten bun, nu robot.
 """
 
 
+# =========================
+# HELPERS
+# =========================
 def should_save_to_memory(text: str) -> bool:
     t = (text or "").lower()
     keywords = ["retine", "tine minte", "memoreaza", "salveaza", "pastreaza", "noteaza"]
@@ -202,16 +205,74 @@ def clean_text(s: str) -> str:
     return s
 
 
+def parse_workout_text(text: str):
+    """
+    Accepta format simplu, de exemplu:
+    /logworkout Piept aparat | 10 | 12 | 7
+    sau
+    Piept aparat, 10 kg, 12 repetari, RPE 7
+    """
+    raw = clean_text(text)
+    if raw.startswith("/logworkout"):
+        raw = clean_text(raw.replace("/logworkout", "", 1))
+
+    if "|" in raw:
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) >= 4:
+            exercitiu = parts[0]
+            greutate = parts[1].replace("kg", "").strip()
+            repetari = parts[2].strip()
+            rpe = parts[3].lower().replace("rpe", "").strip()
+            return {
+                "exercitiu": exercitiu,
+                "greutate": float(greutate.replace(",", ".")),
+                "repetari": int(repetari),
+                "rpe": float(rpe.replace(",", ".")),
+            }
+
+    pattern = re.compile(
+        r"^(?P<exercitiu>.+?)[,\-]\s*(?P<greutate>\d+[\.,]?\d*)\s*kg[,\-]\s*(?P<repetari>\d+)\s*(?:rep|repetari)?[,\-]\s*rpe\s*(?P<rpe>\d+[\.,]?\d*)$",
+        re.IGNORECASE,
+    )
+    m = pattern.match(raw)
+    if m:
+        return {
+            "exercitiu": m.group("exercitiu").strip(),
+            "greutate": float(m.group("greutate").replace(",", ".")),
+            "repetari": int(m.group("repetari")),
+            "rpe": float(m.group("rpe").replace(",", ".")),
+        }
+
+    return None
+
+
+def send_workout_to_google_sheet(user_id: int, workout: dict) -> tuple[bool, str]:
+    if not GOOGLE_SCRIPT_URL:
+        return False, "Lipseste GOOGLE_SCRIPT_URL din variabilele de mediu."
+
+    payload = {
+        "exercitiu": workout["exercitiu"],
+        "greutate": workout["greutate"],
+        "repetari": workout["repetari"],
+        "rpe": workout["rpe"],
+        "id": f"{user_id}-{int(datetime.now(timezone.utc).timestamp())}",
+    }
+
+    try:
+        resp = requests.post(GOOGLE_SCRIPT_URL, json=payload, timeout=15)
+        if 200 <= resp.status_code < 300:
+            return True, resp.text.strip() or "OK"
+        return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 # =========================
 # OpenAI helpers
 # =========================
 def openai_text_reply(profile: str, notes: str, history: list, user_text: str) -> str:
-    # folosim Responses API (recomandat) ca sa fie usor si pentru vision
     input_messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT.strip(),
-        },
+        {"role": "system", "content": SYSTEM_PROMPT.strip()},
     ]
 
     if profile:
@@ -219,7 +280,6 @@ def openai_text_reply(profile: str, notes: str, history: list, user_text: str) -
     if notes:
         input_messages.append({"role": "system", "content": f"NOTE MEMORIE (relevante):\n{notes}"})
 
-    # istoric scurt
     for m in history[-MAX_HISTORY:]:
         input_messages.append({"role": m["role"], "content": m["content"]})
 
@@ -231,7 +291,6 @@ def openai_text_reply(profile: str, notes: str, history: list, user_text: str) -
         temperature=0.6,
     )
 
-    # extragem textul
     out_text = ""
     for item in resp.output:
         if item.type == "message":
@@ -254,7 +313,6 @@ def openai_vision_reply(profile: str, notes: str, history: list, user_text: str,
     for m in history[-MAX_HISTORY:]:
         input_messages.append({"role": m["role"], "content": m["content"]})
 
-    # mesaj multimodal
     input_messages.append(
         {
             "role": "user",
@@ -284,9 +342,8 @@ def openai_vision_reply(profile: str, notes: str, history: list, user_text: str,
 # Telegram handlers
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # un singur salut, curat
     await update.message.reply_text(
-        "Salut, Laurentiu. Sunt DAN. Spune-mi ce vrei sa lucram acum (sala, nutritie, rutina, plan)."
+        "Salut, Laurentiu. Sunt DAN. Spune-mi ce vrei sa lucram acum: sala, nutritie, rutina, plan sau /logworkout."
     )
 
 
@@ -316,14 +373,44 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Profilul a fost salvat/actualizat.")
 
 
+async def logworkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text or ""
+    workout = parse_workout_text(text)
+
+    if not workout:
+        await update.message.reply_text(
+            "Formatul nu a fost inteles. Foloseste asa:\n/logworkout Piept aparat | 10 | 12 | 7\n\nsau:\n/logworkout Piept aparat, 10 kg, 12 repetari, RPE 7"
+        )
+        return
+
+    add_history(user_id, "user", f"[WORKOUT] {json.dumps(workout, ensure_ascii=False)}")
+    ok, info = send_workout_to_google_sheet(user_id, workout)
+
+    if ok:
+        reply = (
+            f"Am salvat exercitiul ✅\n"
+            f"- Exercitiu: {workout['exercitiu']}\n"
+            f"- Greutate: {workout['greutate']}\n"
+            f"- Repetari: {workout['repetari']}\n"
+            f"- RPE: {workout['rpe']}"
+        )
+    else:
+        reply = (
+            "Am inteles exercitiul, dar nu l-am putut trimite in Google Sheet.\n"
+            f"Motiv: {info}"
+        )
+
+    add_history(user_id, "assistant", reply)
+    await update.message.reply_text(reply)
+
+
 async def chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = clean_text(update.message.text or "")
 
-    # salvam input in istoric
     add_history(user_id, "user", user_text)
 
-    # daca utilizatorul cere explicit memorie in text, salvam ca nota
     if should_save_to_memory(user_text):
         add_note(user_id, user_text)
 
@@ -347,12 +434,10 @@ async def chat_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = (update.message.caption or "").strip()
     user_text = clean_text(caption) if caption else "Analizeaza poza si spune-mi concluzii + recomandari."
 
-    # luam cea mai mare poza
     photo = update.message.photo[-1]
     file = await photo.get_file()
     image_bytes = await file.download_as_bytearray()
 
-    # salvam in istoric ca eveniment
     add_history(user_id, "user", f"[PHOTO] {user_text}")
 
     profile_txt = get_profile(user_id)
@@ -377,10 +462,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("remember", remember))
     app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("logworkout", logworkout))
 
-    # poze
     app.add_handler(MessageHandler(filters.PHOTO, chat_photo))
-    # text normal
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_text))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
@@ -388,3 +472,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
