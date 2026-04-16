@@ -187,8 +187,7 @@ def get_last_workout_day(user_id: int) -> int:
 
 
 def get_next_workout_day(user_id: int) -> int:
-    last_day = get_last_workout_day(user_id)
-    return (last_day % 5) + 1
+    return (get_last_workout_day(user_id) % 5) + 1
 
 
 def get_workout_day_label(day: int) -> str:
@@ -309,6 +308,7 @@ Reguli importante:
 - daca utilizatorul pare obosit, reduci intensitatea
 - daca utilizatorul merge bine, poti sugera progresie usoara
 - daca in prompt exista recomandari din istoric, le folosesti concret in program
+- daca utilizatorul trimite un mesaj clar de tip exercitiu + greutate + repetari + RPE, il tratezi ca workout log
 - raspunsurile trebuie sa fie clare, scurte-medii si utile
 
 Cand utilizatorul trimite antrenamente efectuate:
@@ -365,6 +365,13 @@ def is_gym_trigger(text: str) -> bool:
         "am ajuns la sală",
     ]
     return any(trigger in t for trigger in triggers)
+
+
+def looks_like_workout_log(text: str) -> bool:
+    raw = clean_text(text)
+    if raw.startswith("/logworkout"):
+        return True
+    return parse_workout_text(raw) is not None
 
 
 def build_workout_request(user_id: int, original_text: str) -> tuple[str, int, str]:
@@ -453,6 +460,26 @@ def send_workout_to_google_sheet(user_id: int, workout: dict) -> tuple[bool, str
         return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
+
+
+def build_workout_saved_reply(user_id: int, workout: dict, ok: bool, info: str) -> str:
+    progress_hint = get_progress_hint_for_exercise(user_id, workout["exercitiu"])
+
+    if ok:
+        return (
+            f"Am salvat exercitiul ✅\n"
+            f"- Exercitiu: {workout['exercitiu']}\n"
+            f"- Greutate: {workout['greutate']}\n"
+            f"- Repetari: {workout['repetari']}\n"
+            f"- RPE: {workout['rpe']}\n\n"
+            f"Repere pentru data viitoare:\n{progress_hint}"
+        )
+
+    return (
+        "Am inteles exercitiul, dar nu l-am putut trimite in Google Sheet.\n"
+        f"Motiv: {info}\n\n"
+        f"Repere pentru data viitoare:\n{progress_hint}"
+    )
 
 
 # =========================
@@ -574,24 +601,7 @@ async def logworkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     add_history(user_id, "user", f"[WORKOUT] {json.dumps(workout, ensure_ascii=False)}")
     ok, info = send_workout_to_google_sheet(user_id, workout)
-
-    progress_hint = get_progress_hint_for_exercise(user_id, workout["exercitiu"])
-
-    if ok:
-        reply = (
-            f"Am salvat exercitiul ✅\n"
-            f"- Exercitiu: {workout['exercitiu']}\n"
-            f"- Greutate: {workout['greutate']}\n"
-            f"- Repetari: {workout['repetari']}\n"
-            f"- RPE: {workout['rpe']}\n\n"
-            f"Repere pentru data viitoare:\n{progress_hint}"
-        )
-    else:
-        reply = (
-            "Am inteles exercitiul, dar nu l-am putut trimite in Google Sheet.\n"
-            f"Motiv: {info}\n\n"
-            f"Repere pentru data viitoare:\n{progress_hint}"
-        )
+    reply = build_workout_saved_reply(user_id, workout, ok, info)
 
     add_history(user_id, "assistant", reply)
     await update.message.reply_text(reply)
@@ -600,6 +610,17 @@ async def logworkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def chat_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = clean_text(update.message.text or "")
+
+    # AUTO LOG fara /logworkout
+    if looks_like_workout_log(user_text) and not user_text.startswith("/"):
+        workout = parse_workout_text(user_text)
+        if workout:
+            add_history(user_id, "user", f"[WORKOUT] {json.dumps(workout, ensure_ascii=False)}")
+            ok, info = send_workout_to_google_sheet(user_id, workout)
+            reply = build_workout_saved_reply(user_id, workout, ok, info)
+            add_history(user_id, "assistant", reply)
+            await update.message.reply_text(reply)
+            return
 
     if is_gym_trigger(user_text):
         enriched_text, day, grupa = build_workout_request(user_id, user_text)
@@ -687,4 +708,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
