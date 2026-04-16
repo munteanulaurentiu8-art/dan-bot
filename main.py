@@ -332,6 +332,14 @@ def build_workout_request(user_id: int, original_text: str) -> tuple[str, int, s
     day = get_next_workout_day(user_id)
     grupa = get_workout_day_label(day)
 
+    text_lower = original_text.lower()
+
+    adaptare = []
+    if any(x in text_lower for x in ["obosit", "rupt", "fara energie", "fără energie", "greu azi", "am febra", "am febră"]):
+        adaptare.append(
+            "Utilizatorul spune ca este obosit. Redu volumul total cu aproximativ 20-30%, foloseste greutati moderate si evita intensitatea foarte mare."
+        )
+
     enriched = (
         f"{original_text}\n\n"
         f"Astazi este Ziua {day}: {grupa}.\n"
@@ -340,8 +348,12 @@ def build_workout_request(user_id: int, original_text: str) -> tuple[str, int, s
         f"2. Exercitii la saltea / activare / core\n"
         f"3. Exercitii principale la aparate sau gantere\n"
         f"4. Stretching final\n\n"
-        f"Fa programul clar, practic, bine structurat si direct aplicabil in sala."
+        f"Fa programul clar, practic, bine structurat si direct aplicabil in sala.\n"
     )
+
+    if adaptare:
+        enriched += "\nReguli adaptive suplimentare:\n- " + "\n- ".join(adaptare)
+
     return enriched, day, grupa
 
 
