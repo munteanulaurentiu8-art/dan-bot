@@ -284,6 +284,32 @@ def clean_text(s: str) -> str:
     return s
 
 
+def normalize_exercise_name(name: str) -> str:
+    if not name:
+        return ""
+
+    name = name.lower().strip()
+
+    remove_words = [
+        "azi am facut",
+        "azi am făcut",
+        "azi am lucrat",
+        "am am facut",
+        "am am făcut",
+        "am facut",
+        "am făcut",
+        "am lucrat",
+        "azi",
+        "am",
+    ]
+
+    for w in remove_words:
+        name = name.replace(w, " ")
+
+    name = re.sub(r"\s+", " ", name).strip(" -_,.;:")
+    return name
+
+
 def is_gym_trigger(text: str) -> bool:
     t = (text or "").lower()
     triggers = [
@@ -331,9 +357,9 @@ def parse_workout_text(text: str):
         raw = clean_text(raw.replace("/logworkout", "", 1))
 
     if "|" in raw:
-        parts = [p.strip() for p in raw.split("|")]
+        parts = [p.strip() for p in raw.split("|") if p.strip()]
         if len(parts) >= 4:
-            exercitiu = parts[0]
+            exercitiu = normalize_exercise_name(parts[0])
             greutate = parts[1].replace("kg", "").strip()
             repetari = parts[2].strip()
             rpe = parts[3].lower().replace("rpe", "").strip()
@@ -355,7 +381,7 @@ def parse_workout_text(text: str):
     if m:
         try:
             return {
-                "exercitiu": m.group("exercitiu").strip(),
+                "exercitiu": normalize_exercise_name(m.group("exercitiu")),
                 "greutate": float(m.group("greutate").replace(",", ".")),
                 "repetari": int(m.group("repetari")),
                 "rpe": float(m.group("rpe").replace(",", ".")),
@@ -397,14 +423,15 @@ def get_last_logged_workout(user_id: int, exercitiu: str):
     rows = cur.fetchall()
     conn.close()
 
-    exercitiu_lower = exercitiu.strip().lower()
+    exercitiu_lower = normalize_exercise_name(exercitiu)
 
     for row in rows:
         content = row[0]
         try:
             payload = content.replace("[WORKOUT] ", "", 1)
             data = json.loads(payload)
-            if data.get("exercitiu", "").strip().lower() == exercitiu_lower:
+            saved_exercise = normalize_exercise_name(data.get("exercitiu", ""))
+            if saved_exercise == exercitiu_lower:
                 return data
         except Exception:
             continue
