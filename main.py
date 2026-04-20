@@ -438,7 +438,7 @@ else:
     if adaptare:
         enriched += "\nReguli adaptive suplimentare:\n- " + "\n- ".join(adaptare)
 
-    return enriched, day, grupa
+     return enriched, day, grupa
 
 
 def parse_workout_text(text: str):
