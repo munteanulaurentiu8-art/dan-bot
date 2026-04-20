@@ -406,16 +406,14 @@ def is_gym_trigger(text: str) -> bool:
 
 
 def build_workout_request(user_id: int, original_text: str) -> tuple[str, int, str]:
-    import re
+    match = re.search(r"ziua\s*(\d)", original_text.lower())
 
-match = re.search(r"ziua\s*(\d)", original_text.lower())
+    if match:
+        day = int(match.group(1))
+    else:
+        day = get_next_workout_day(user_id)
 
-if match:
-    day = int(match.group(1))
-else:
-    day = get_next_workout_day(user_id)
     grupa = get_workout_day_label(day)
-
     text_lower = original_text.lower()
 
     adaptare = []
@@ -432,11 +430,12 @@ else:
         f"2. Exercitii la saltea / activare / core\n"
         f"3. Exercitii principale la aparate sau gantere\n"
         f"4. Stretching final\n\n"
-        f"Fa programul clar, practic, bine structurat si direct aplicabil in sala.\n"
+        f"Fa programul clar, practic, bine structurat si direct aplicabil in sala."
     )
 
     if adaptare:
         enriched += "\nReguli adaptive suplimentare:\n- " + "\n- ".join(adaptare)
+
     return enriched, day, grupa
 
 
