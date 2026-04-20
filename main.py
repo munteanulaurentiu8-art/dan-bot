@@ -424,7 +424,8 @@ def build_workout_request(user_id: int, original_text: str) -> tuple[str, int, s
 
     enriched = (
         f"{original_text}\n\n"
-        f"Astazi este Ziua {day}: {grupa}.\n"
+        f"🔥 Ziua {day}: {grupa}\n\n"
+        f"Începem antrenamentul 👇\n"
         f"Creeaza un antrenament complet pentru aceasta zi, respectand structura fixa:\n"
         f"1. Incalzire\n"
         f"2. Exercitii la saltea / activare / core\n"
